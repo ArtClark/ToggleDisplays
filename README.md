@@ -38,6 +38,27 @@ toggler that gates on that flag alone will happily disable the panel and enable
 a display that cannot light up. That is how you get a black screen and a success
 message.
 
+### How far those numbers actually go
+
+Each cell above is a single run, `ERROR_GEN_FAILURE` is a generic code, and all
+of it was measured against a *sleeping* TV — so a validate success is not a
+promise that an apply would produce a visible desktop. Two further limits worth
+stating, because this area attracted a wrong conclusion during development:
+
+- The `0x440` row fails on **every** configuration tried, including the one that
+  succeeds at `0x460`. So `SDC_USE_SUPPLIED_DISPLAY_CONFIG` is *not* removable.
+  An earlier draft of this file argued for dropping it; that was wrong, and the
+  measurement contradicts it. What the numbers support is narrower: when you
+  supply your own path array without that flag, the mode array has to match the
+  buffer size for those paths, and a `QDC_ALL_PATHS` mode array is too large.
+- One failing row in the table is a bug in the probe rather than a fact about
+  Windows, so treat it as absent. The workable recipe is the narrow one: start
+  from `QDC_ONLY_ACTIVE_PATHS` and add exactly one external source path.
+
+The reason this tool delegates is not that a direct implementation is impossible
+— it is that the direct route has a large fiddly surface, and `DisplaySwitch.exe`
+is Microsoft's own, already-correct, already-shipped answer to the same problem.
+
 **Safety.** `DisplaySwitch` is atomic. It either applies the whole topology
 change or does nothing, so this tool can never leave the desktop on a display
 that is not lit.
