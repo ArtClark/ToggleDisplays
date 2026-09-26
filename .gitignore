@@ -1,0 +1,8 @@
+# Build output
+*.exe
+*.obj
+*.pdb
+*.ilk
+
+# Per-project conversation log, git-ignored by convention
+chat.json
