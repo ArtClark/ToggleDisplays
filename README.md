@@ -130,3 +130,8 @@ lands in the repository root and is git-ignored.
 Windows 7 or later (the CCD API and `DisplaySwitch.exe`). No runtime
 dependencies beyond `user32.dll`. Nothing is installed and nothing is
 registered.
+
+## License
+
+MIT — see [LICENSE](LICENSE). The file was added by GitHub when the repository
+was created and is unrelated to the code commits.
