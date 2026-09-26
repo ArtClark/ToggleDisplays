@@ -50,7 +50,9 @@ if errorlevel 1 (
 )
 
 pushd "%~dp0src"
-cl /nologo /EHsc /std:c++17 /W3 /O2 /Fe:"%~dp0ToggleDisplays.exe" ToggleDisplays.cpp user32.lib
+rem /W4 /WX: the code is warning-clean at the strictest practical level, and
+rem /WX keeps it that way. A warning here is a real defect, not noise.
+cl /nologo /EHsc /std:c++17 /W4 /WX /O2 /Fe:"%~dp0ToggleDisplays.exe" ToggleDisplays.cpp user32.lib
 set RC=%ERRORLEVEL%
 popd
 

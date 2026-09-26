@@ -7,59 +7,77 @@
  *
  * WHY IT DELEGATES THE MUTATION
  *   Topology changes are handed entirely to DisplaySwitch.exe, Microsoft's own
- *   implementation. This tool never calls SetDisplayConfig. Two reasons:
+ *   implementation. This tool never calls SetDisplayConfig in a way that can
+ *   change anything. Two reasons:
  *
  *     1. Correctness. DisplaySwitch picks the external display's native mode,
  *        makes it primary at (0,0), and turns the panel off. Reimplementing
- *        that means hand-building a display configuration. Measured on the
- *        development machine, feeding a QueryDisplayConfig(QDC_ALL_PATHS)
- *        snapshot straight back into SetDisplayConfig does not validate -
- *        ERROR_INVALID_PARAMETER - because an all-paths snapshot is not a valid
- *        input configuration. It is a list of paths, not a topology.
+ *        that means hand-building a display configuration, and it turns out to
+ *        be harder than it looks. A QueryDisplayConfig(QDC_ALL_PATHS) snapshot
+ *        fed straight back into SetDisplayConfig does not validate -
+ *        ERROR_INVALID_PARAMETER - because an all-paths snapshot is a list of
+ *        paths, not a topology. Measured: enabling every available external path
+ *        fails where enabling exactly one succeeds.
  *
  *     2. Safety. DisplaySwitch is atomic: it either applies the whole topology
  *        change or does nothing. So this tool can never leave the desktop on a
  *        display that is not lit. A hand-rolled toggler invites exactly that
  *        failure - enable an external target that reports targetAvailable=1
- *        while the TV is asleep, disable the panel, report success, and leave
- *        a black screen. That is not hypothetical: a sleeping TV reports
- *        targetAvailable=1, so "available" is not "can be lit".
+ *        while the TV is asleep, disable the panel, report success, and leave a
+ *        black screen. "Available" is not "usable".
+ *
+ *   --probe is the deliberate exception, and it is read-only: it calls
+ *   SetDisplayConfig with SDC_VALIDATE and never passes SDC_APPLY. See the
+ *   comment above runProbe() for the safety bound that makes that an argument
+ *   rather than a promise.
  *
  * WHY IT WAITS
  *   No API can wake a powered-off TV. Many TVs also sleep on their own timer,
- *   which will interrupt a switch that is already in flight. So the tool asks,
- *   verifies, and retries, treating "the display is asleep" as an expected
- *   state rather than an error. If you switch the TV on while it waits, the
- *   rest happens by itself.
+ *   which will interrupt a switch already in flight. So the tool asks, verifies,
+ *   and retries, treating "the display is asleep" as an expected state rather
+ *   than an error. If you switch the TV on while it waits, the rest happens by
+ *   itself.
  *
  * HOW IT VERIFIES
  *   Read-only, through the CCD API. Internal versus external is decided by
  *   output technology - INTERNAL / LVDS / DISPLAYPORT_EMBEDDED is the panel;
  *   HDMI / DVI / external DisplayPort is external. That is a property of the
  *   hardware, not of enumeration order, which is what keeps this correct on a
- *   laptop with two GPUs and several connectors. Note that availability must
- *   be counted from QDC_ALL_PATHS: an inactive target is absent from a
- *   QDC_ONLY_ACTIVE_PATHS result, so counting it from the active view always
- *   reports zero.
+ *   laptop with two GPUs and several connectors. No code anywhere keys off an
+ *   array index as an identifier: paths are always walked in a counted loop and
+ *   classified by technology and by EDID target name.
+ *
+ *   Note that availability must be counted from QDC_ALL_PATHS: an inactive
+ *   target does not appear in a QDC_ONLY_ACTIVE_PATHS result at all, so
+ *   counting it from the active view is structurally guaranteed to report zero.
+ *
+ *   --to-external NAME is a *verification* constraint, not a selector.
+ *   DisplaySwitch.exe cannot be told which external display to prefer, so
+ *   naming one means "switch, and require that this is the display that came
+ *   up". A mismatch is reported as a failure rather than quietly accepted.
  *
  * USAGE
- *   ToggleDisplays                     toggle (default)
- *   ToggleDisplays --to-external       wait for an external display, show only it
- *   ToggleDisplays --to-internal       go back to the internal panel only
- *   ToggleDisplays --status            print the current topology and exit
- *   ToggleDisplays --dry-run           say what a toggle would do, change nothing
- *   ToggleDisplays --timeout N         seconds to keep trying (default 90)
- *   ToggleDisplays --verbose           print the topology after every attempt
- *   ToggleDisplays --quiet             no output at all
+ *   ToggleDisplays                        toggle (default)
+ *   ToggleDisplays --to-external [NAME]   wait for an external display, show only it
+ *   ToggleDisplays --to-internal          go back to the internal panel only
+ *   ToggleDisplays --status               print the current topology and exit
+ *   ToggleDisplays --list-externals       list external targets by EDID name
+ *   ToggleDisplays --dry-run              say what a toggle would do, change nothing
+ *   ToggleDisplays --probe                validate-only display-config probe
+ *   ToggleDisplays --json                 machine-readable output (with --status)
+ *   ToggleDisplays --timeout N            seconds to keep trying (default 90)
+ *   ToggleDisplays --verbose              print the topology after every attempt
+ *   ToggleDisplays --quiet                no output at all
  *   ToggleDisplays --help
  *
  * EXIT CODES
  *   0  the requested topology is in place
- *   1  gave up; nothing was changed
+ *   1  gave up, or --probe was rejected by SetDisplayConfig; nothing was changed
  *   2  bad arguments
+ *   3  --probe found no external target to validate against
  *
  * Build (x64), or just run build.cmd:
- *   cl /nologo /EHsc /std:c++17 /W3 /O2 /Fe:ToggleDisplays.exe ^
+ *   cl /nologo /EHsc /std:c++17 /W4 /WX /O2 /Fe:ToggleDisplays.exe ^
  *      ToggleDisplays.cpp user32.lib
  */
 
@@ -76,12 +94,13 @@
 
 static bool g_quiet   = false;
 static bool g_verbose = false;
+static bool g_json    = false;
 
 /* ------------------------------------------------------------------ output */
 
 static void out(const wchar_t* fmt, ...)
 {
-    if (g_quiet) return;
+    if (g_quiet || g_json) return;
     wchar_t buf[1024];
     va_list ap;
     va_start(ap, fmt);
@@ -101,9 +120,44 @@ static void out(const wchar_t* fmt, ...)
  */
 static void fail(const wchar_t* msg)
 {
-    fwprintf(stderr, L"\nFAILED\n");
-    fwprintf(stderr, L"%s\n", msg);
-    fflush(stderr);
+    if (!g_json) {
+        fwprintf(stderr, L"\nFAILED\n");
+        fwprintf(stderr, L"%s\n", msg);
+        fflush(stderr);
+    }
+}
+
+static const wchar_t* errName(LONG r)
+{
+    switch (r) {
+    case ERROR_SUCCESS:           return L"ERROR_SUCCESS";
+    case ERROR_ACCESS_DENIED:     return L"ERROR_ACCESS_DENIED";
+    case ERROR_INVALID_PARAMETER: return L"ERROR_INVALID_PARAMETER";
+    case ERROR_INVALID_FLAGS:     return L"ERROR_INVALID_FLAGS";
+    case ERROR_NOT_SUPPORTED:     return L"ERROR_NOT_SUPPORTED";
+    case ERROR_CALL_NOT_IMPLEMENTED: return L"ERROR_CALL_NOT_IMPLEMENTED";
+    case ERROR_BUSY:              return L"ERROR_BUSY";
+    default:                      return L"(unnamed)";
+    }
+}
+
+/* Minimal JSON string escaping, operating on UTF-8 bytes. EDID names are not
+ * attacker-controlled, but they are not guaranteed free of quotes, backslashes
+ * or control characters either, and malformed output is worse than none.
+ * Wide callers convert first, so there is exactly one escaper to get right. */
+static void jsonEscape(const char* s)
+{
+    putchar('"');
+    for (const unsigned char* p = (const unsigned char*)s; *p; ++p) {
+        if      (*p == '"')  fputs("\\\"", stdout);
+        else if (*p == '\\') fputs("\\\\", stdout);
+        else if (*p == '\n') fputs("\\n", stdout);
+        else if (*p == '\r') fputs("\\r", stdout);
+        else if (*p == '\t') fputs("\\t", stdout);
+        else if (*p < 0x20)   printf("\\u%04x", (unsigned)*p);
+        else                 putchar((int)*p);
+    }
+    putchar('"');
 }
 
 /* -------------------------------------------------------------- topology -- */
@@ -132,15 +186,6 @@ static const wchar_t* techLabel(DISPLAYCONFIG_VIDEO_OUTPUT_TECHNOLOGY t)
     }
 }
 
-struct Topology {
-    int  internalActive    = 0;   /* ACTIVE internal paths  */
-    int  externalActive    = 0;   /* ACTIVE external paths  */
-    int  externalAvailable = 0;   /* available external targets, active or not */
-    int  attachedToDesktop = 0;   /* EnumDisplayDevices entries attached */
-    DISPLAYCONFIG_VIDEO_OUTPUT_TECHNOLOGY activeExternalTech =
-        DISPLAYCONFIG_OUTPUT_TECHNOLOGY_OTHER;
-};
-
 static int countAttachedDisplays()
 {
     int n = 0;
@@ -155,37 +200,113 @@ static int countAttachedDisplays()
 }
 
 /*
+ * Resolve a target's EDID friendly name ("TV TOSHIBA", "DELL U2412M").
+ *
+ * The name is only trustworthy when flags.friendlyNameFromEdid is set. Windows
+ * synthesises a placeholder such as "Generic PnP Monitor" when the display
+ * reports no usable EDID, and matching on that would let this tool claim to
+ * have found a particular television when it found nothing of the sort. The
+ * bit is carried back to the caller so the distinction stays visible.
+ */
+static bool queryTargetName(LUID adapterId, UINT32 targetId,
+                            wchar_t* out, size_t outChars, bool* fromEdid)
+{
+    if (out && outChars) out[0] = L'\0';
+    if (fromEdid) *fromEdid = false;
+
+    DISPLAYCONFIG_TARGET_DEVICE_NAME tdn;
+    ZeroMemory(&tdn, sizeof(tdn));
+    tdn.header.type      = DISPLAYCONFIG_DEVICE_INFO_GET_TARGET_NAME;
+    tdn.header.size      = sizeof(tdn);
+    tdn.header.adapterId = adapterId;
+    tdn.header.id        = targetId;
+
+    if (DisplayConfigGetDeviceInfo(&tdn.header) != ERROR_SUCCESS) return false;
+    if (fromEdid) *fromEdid = (tdn.flags.friendlyNameFromEdid != 0);
+
+    if (out && outChars) {
+        wcsncpy_s(out, outChars, tdn.monitorFriendlyDeviceName, _TRUNCATE);
+        /* EDID strings are space-padded to the full 64 characters. */
+        for (size_t n = wcslen(out); n > 0 && out[n - 1] == L' '; --n) out[n - 1] = L'\0';
+        if (out[0] == L'\0') wcscpy_s(out, outChars, L"(unnamed)");
+    }
+    return true;
+}
+
+struct ExtTarget {
+    DISPLAYCONFIG_VIDEO_OUTPUT_TECHNOLOGY tech;
+    UINT32  targetId;
+    LUID    adapterId;
+    bool    available;
+    wchar_t name[64];
+    bool    nameFromEdid;
+};
+
+/*
  * Available-but-inactive external targets.
  *
  * This MUST use QDC_ALL_PATHS. An inactive target does not appear in a
  * QDC_ONLY_ACTIVE_PATHS result at all, so counting availability from the
  * active-paths view is structurally guaranteed to report zero - which is the
  * bug the first build of this tool shipped. Measured on the development
- * machine: the sleeping TV reports targetAvailable=1 on three paths, while
- * the active-paths view can only ever show the one internal path.
+ * machine: the sleeping TV reports targetAvailable=1 on three paths, while the
+ * active-paths view can only ever show the one internal path.
  */
-static int countAvailableExternalTargets()
+static std::vector<ExtTarget> listExternalTargets()
 {
+    std::vector<ExtTarget> v;
+
     UINT32 pc = 0, mc = 0;
-    if (GetDisplayConfigBufferSizes(QDC_ALL_PATHS, &pc, &mc) != ERROR_SUCCESS) return 0;
+    if (GetDisplayConfigBufferSizes(QDC_ALL_PATHS, &pc, &mc) != ERROR_SUCCESS) return v;
     std::vector<DISPLAYCONFIG_PATH_INFO> paths(pc);
     std::vector<DISPLAYCONFIG_MODE_INFO> modes(mc);
-    if (QueryDisplayConfig(QDC_ALL_PATHS, &pc, paths.data(), &mc, modes.data(), NULL) != ERROR_SUCCESS) return 0;
+    if (QueryDisplayConfig(QDC_ALL_PATHS, &pc, paths.data(), &mc, modes.data(), NULL) != ERROR_SUCCESS)
+        return v;
 
-    int n = 0;
+    /* A target is reachable through several source paths; de-duplicate on
+     * (adapterId, targetId) so one physical display is listed once. */
     for (UINT32 i = 0; i < pc; ++i) {
         if (isInternalTech(paths[i].targetInfo.outputTechnology)) continue;
-        if (paths[i].targetInfo.targetAvailable) ++n;
+
+        ExtTarget e;
+        e.tech     = paths[i].targetInfo.outputTechnology;
+        e.targetId = paths[i].targetInfo.id;
+        e.adapterId = paths[i].targetInfo.adapterId;
+        e.available = paths[i].targetInfo.targetAvailable != 0;
+
+        bool dup = false;
+        for (const auto& x : v)
+            if (x.targetId == e.targetId && x.adapterId.LowPart == e.adapterId.LowPart
+                                           && x.adapterId.HighPart == e.adapterId.HighPart)
+                dup = true;
+        if (dup) continue;
+
+        if (!queryTargetName(e.adapterId, e.targetId, e.name, _countof(e.name), &e.nameFromEdid)) {
+            wcscpy_s(e.name, _countof(e.name), L"(unavailable)");
+            e.nameFromEdid = false;
+        }
+        v.push_back(e);
     }
-    return n;
+    return v;
 }
+
+struct Topology {
+    int  internalActive    = 0;   /* ACTIVE internal paths  */
+    int  externalActive    = 0;   /* ACTIVE external paths  */
+    int  externalAvailable = 0;   /* available external targets, active or not */
+    int  attachedToDesktop = 0;   /* EnumDisplayDevices entries attached */
+    DISPLAYCONFIG_VIDEO_OUTPUT_TECHNOLOGY activeExternalTech =
+        DISPLAYCONFIG_OUTPUT_TECHNOLOGY_OTHER;
+    wchar_t activeExternalName[64]     = L"";
+    bool    activeExternalNameFromEdid = false;
+};
 
 /* Read-only. Never changes anything. */
 static Topology queryTopology()
 {
     Topology t;
     t.attachedToDesktop = countAttachedDisplays();
-    t.externalAvailable = countAvailableExternalTargets();
+    t.externalAvailable = (int)listExternalTargets().size();
 
     UINT32 pc = 0, mc = 0;
     if (GetDisplayConfigBufferSizes(QDC_ONLY_ACTIVE_PATHS, &pc, &mc) != ERROR_SUCCESS) return t;
@@ -196,10 +317,15 @@ static Topology queryTopology()
 
     for (UINT32 i = 0; i < pc; ++i) {
         if (!(paths[i].flags & DISPLAYCONFIG_PATH_ACTIVE)) continue;
-        if (isInternalTech(paths[i].targetInfo.outputTechnology)) ++t.internalActive;
-        else {
-            ++t.externalActive;
+        if (isInternalTech(paths[i].targetInfo.outputTechnology)) { ++t.internalActive; continue; }
+
+        ++t.externalActive;
+        /* First active external wins; in practice there is only ever one. */
+        if (t.externalActive == 1) {
             t.activeExternalTech = paths[i].targetInfo.outputTechnology;
+            queryTargetName(paths[i].targetInfo.adapterId, paths[i].targetInfo.id,
+                            t.activeExternalName, _countof(t.activeExternalName),
+                            &t.activeExternalNameFromEdid);
         }
     }
     return t;
@@ -214,9 +340,42 @@ static void reportTopology(const wchar_t* when)
     out(L"    external       : %s (%d active path%s, %d target%s available)",
         t.externalActive ? L"ON " : L"off", t.externalActive, t.externalActive == 1 ? L"" : L"s",
         t.externalAvailable, t.externalAvailable == 1 ? L"" : L"s");
-    if (t.externalActive)
+    if (t.externalActive) {
         out(L"    external is    : %s", techLabel(t.activeExternalTech));
+        out(L"    named          : %s%s", t.activeExternalName,
+            t.activeExternalNameFromEdid ? L"" : L"   (synthesised - no usable EDID, do not match on this)");
+    }
     out(L"    displays attached to the desktop: %d", t.attachedToDesktop);
+}
+
+/* Narrow a wide string to UTF-8 for JSON emission. */
+static void jsonField(const char* key, const wchar_t* value)
+{
+    char utf8[512] = {0};
+    if (value) WideCharToMultiByte(CP_UTF8, 0, value, -1, utf8, sizeof(utf8), NULL, NULL);
+    printf("\"%s\":", key);
+    jsonEscape(utf8[0] ? utf8 : "");
+    putchar(',');
+}
+static void reportTopologyJson()
+{
+    const Topology t = queryTopology();
+    fputs("{", stdout);
+    printf("\"internalActive\":%d,", t.internalActive);
+    printf("\"internalOn\":%s,",     t.internalActive ? "true" : "false");
+    printf("\"externalActive\":%d,", t.externalActive);
+    printf("\"externalOn\":%s,",     t.externalActive ? "true" : "false");
+    printf("\"externalAvailable\":%d,", t.externalAvailable);
+    printf("\"attachedToDesktop\":%d,", t.attachedToDesktop);
+    if (t.externalActive) {
+        jsonField("externalTech", techLabel(t.activeExternalTech));
+        jsonField("externalName", t.activeExternalName);
+        printf("\"externalNameFromEdid\":%s", t.activeExternalNameFromEdid ? "true" : "false");
+    } else {
+        fputs("\"externalTech\":null,\"externalName\":null,\"externalNameFromEdid\":null", stdout);
+    }
+    fputs("}\n", stdout);
+    fflush(stdout);
 }
 
 static bool isExternalOnly() { const Topology t = queryTopology(); return t.internalActive == 0 && t.externalActive > 0; }
@@ -240,6 +399,18 @@ static Target resolveToggleTarget(const Topology& t)
 static const wchar_t* targetName(Target t)
 {
     return t == Target::ToExternal ? L"the external display only" : L"the internal panel only";
+}
+
+/*
+ * Does the lit external display satisfy the user's name constraint?
+ * Substring, case-insensitive. A name that came from no EDID never matches,
+ * because matching on "Generic PnP Monitor" would be meaningless.
+ */
+static bool nameMatches(const Topology& t, const wchar_t* want)
+{
+    if (!want || !*want) return true;
+    if (!t.externalActive || !t.activeExternalNameFromEdid) return false;
+    return wcsstr(t.activeExternalName, want) != NULL;
 }
 
 /* --------------------------------------------------------------- the ask -- */
@@ -272,6 +443,104 @@ static bool waitFor(bool (*predicate)(), int millis)
     }
 }
 
+/* ----------------------------------------------------------------- probe -- */
+
+/*
+ * VALIDATE-ONLY display-config probe.
+ *
+ * SetDisplayConfig is called with SDC_VALIDATE and SDC_APPLY is never passed,
+ * so no configuration is committed. "We omit the apply flag" is an argument,
+ * not a guarantee, so there is a structural safety bound as well: the internal
+ * panel's active path is force-kept ACTIVE in the array. Nothing under test
+ * concerns the panel, so keeping it lit does not affect the measurement, and
+ * it bounds the worst case to "nothing happens" rather than "panel goes dark".
+ *
+ * The array is the recipe that actually validated on this machine: the
+ * QDC_ALL_PATHS snapshot with the internal path ACTIVE, exactly ONE available
+ * external path ACTIVE, and every unavailable target deactivated. Measured:
+ *   every available external on   -> ERROR_GEN_FAILURE
+ *   exactly one external on       -> ERROR_SUCCESS
+ * An external target is reachable through several source paths, and switching
+ * them all on at once is not a configuration Windows will accept.
+ *
+ * The one thing this cannot tell you: the target display was asleep throughout,
+ * so a validate success is not a promise that an apply would produce a visible
+ * desktop.
+ */
+static int runProbe()
+{
+    const UINT32 flags = SDC_VALIDATE | SDC_ALLOW_CHANGES | SDC_USE_SUPPLIED_DISPLAY_CONFIG;
+
+    /* Defensive: if a future edit ever adds SDC_APPLY here, refuse to run. */
+    if (flags & SDC_APPLY) {
+        fail(L"internal error: probe flags include SDC_APPLY. Refusing to run.");
+        return 1;
+    }
+
+    UINT32 pc = 0, mc = 0;
+    if (GetDisplayConfigBufferSizes(QDC_ALL_PATHS, &pc, &mc) != ERROR_SUCCESS) {
+        fail(L"GetDisplayConfigBufferSizes(QDC_ALL_PATHS) failed.");
+        return 1;
+    }
+    std::vector<DISPLAYCONFIG_PATH_INFO> paths(pc);
+    std::vector<DISPLAYCONFIG_MODE_INFO> modes(mc);
+    if (QueryDisplayConfig(QDC_ALL_PATHS, &pc, paths.data(), &mc, modes.data(), NULL) != ERROR_SUCCESS) {
+        fail(L"QueryDisplayConfig(QDC_ALL_PATHS) failed.");
+        return 1;
+    }
+
+    out(L"validate-only probe. SDC_APPLY (0x80) is not present in the flags below.");
+    out(L"the internal panel is force-kept ACTIVE, so the worst case is 'nothing'.");
+    out(L"baseline: %u paths, %u modes", (unsigned)pc, (unsigned)mc);
+    out(L"");
+
+    /* Classify by technology and availability - never by position. */
+    int  internalIdx = -1, firstExt = -1, extCount = 0;
+    for (UINT32 i = 0; i < pc; ++i) {
+        if (isInternalTech(paths[i].targetInfo.outputTechnology)) {
+            if (internalIdx < 0) internalIdx = (int)i;
+        } else if (paths[i].targetInfo.targetAvailable) {
+            if (firstExt < 0) firstExt = (int)i;
+            ++extCount;
+        }
+    }
+    out(L"internal path index %d; available external paths: %d", internalIdx, extCount);
+
+    if (firstExt < 0) {
+        fail(L"No available external target to validate against. With the TV asleep\n"
+             L"this is exactly the state that makes DisplaySwitch a no-op.");
+        return 3;
+    }
+
+    if (internalIdx >= 0) paths[internalIdx].flags |= DISPLAYCONFIG_PATH_ACTIVE;   /* safety bound */
+    paths[firstExt].flags      |= DISPLAYCONFIG_PATH_ACTIVE;                        /* exactly one */
+    for (UINT32 i = 0; i < pc; ++i) {
+        if ((int)i == internalIdx || (int)i == firstExt) continue;
+        paths[i].flags &= ~DISPLAYCONFIG_PATH_ACTIVE;
+    }
+
+    int active = 0;
+    for (UINT32 i = 0; i < pc; ++i) if (paths[i].flags & DISPLAYCONFIG_PATH_ACTIVE) ++active;
+    out(L"submitting: %u paths, %u modes, %d ACTIVE (panel + 1 external)", (unsigned)pc, (unsigned)mc, active);
+    out(L"");
+
+    SetLastError(0);
+    const LONG r = SetDisplayConfig(pc, paths.data(), mc, modes.data(), flags);
+    const DWORD le = GetLastError();
+
+    out(L"  flags=0x%03X  SetDisplayConfig -> %ld %s", (unsigned)flags, r, errName(r));
+    if (le) out(L"  GetLastError=%lu", (unsigned)le);
+
+    if (r == ERROR_SUCCESS) {
+        out(L"");
+        out(L"Windows would accept this configuration. Nothing was applied.");
+        return 0;
+    }
+    out(L"");
+    out(L"Windows rejected this configuration. Nothing was applied.");
+    return 1;
+}
+
 /* ------------------------------------------------------------------ main -- */
 
 static void usage()
@@ -279,14 +548,19 @@ static void usage()
     fwprintf(stdout,
         L"ToggleDisplays - switch between the internal panel and an external\n"
         L"                 display, without the Control Panel.\n\n"
-        L"  (no arguments)   toggle: the panel is home, the external is away\n"
-        L"  --to-external    wait for an external display, then show only that\n"
-        L"  --to-internal    go back to the internal panel only\n"
-        L"  --status         print the current topology and exit\n"
-        L"  --dry-run        say what a toggle would do, change nothing\n"
-        L"  --timeout N      seconds to keep trying (default %d)\n"
-        L"  --verbose        print the topology after every attempt\n"
-        L"  --quiet          no output at all\n"
+        L"  (no arguments)     toggle: the panel is home, the external is away\n"
+        L"  --to-external [N]  wait for an external display, then show only it.\n"
+        L"                      N (e.g. TOSHIBA) additionally requires that the\n"
+        L"                      display which comes up is the one named\n"
+        L"  --to-internal      go back to the internal panel only\n"
+        L"  --status           print the current topology and exit\n"
+        L"  --list-externals   list external targets by EDID name\n"
+        L"  --dry-run          say what a toggle would do, change nothing\n"
+        L"  --probe            validate-only display-config probe (never applies)\n"
+        L"  --json             machine-readable output, with --status\n"
+        L"  --timeout N        seconds to keep trying (default %d)\n"
+        L"  --verbose          print the topology after every attempt\n"
+        L"  --quiet            no output at all\n"
         L"  --help\n\n"
         L"No API can wake a powered-off TV, so --to-external waits for one to\n"
         L"appear: switch the TV on, or press any button on its remote, while it\n"
@@ -298,16 +572,24 @@ int wmain(int argc, wchar_t** argv)
 {
     int  timeout = DEFAULT_TIMEOUT_SEC;
     bool explicitExternal = false, explicitInternal = false;
-    bool statusOnly = false, dryRun = false;
+    bool statusOnly = false, dryRun = false, probe = false, listExt = false;
+    const wchar_t* wantedName = nullptr;
 
     for (int i = 1; i < argc; ++i) {
         const wchar_t* a = argv[i];
-        if (!_wcsicmp(a, L"--to-external") || !_wcsicmp(a, L"--to-tv"))       explicitExternal = true;
+        if (!_wcsicmp(a, L"--to-external") || !_wcsicmp(a, L"--to-tv")) {
+            explicitExternal = true;
+            /* optional positional: the next token, if it is not another option */
+            if (i + 1 < argc && argv[i + 1][0] != L'-') wantedName = argv[++i];
+        }
         else if (!_wcsicmp(a, L"--to-internal") || !_wcsicmp(a, L"--to-panel")) explicitInternal = true;
         else if (!_wcsicmp(a, L"--status") || !_wcsicmp(a, L"--list"))         statusOnly = true;
         else if (!_wcsicmp(a, L"--dry-run") || !_wcsicmp(a, L"--what-if"))      dryRun = true;
-        else if (!_wcsicmp(a, L"--quiet"))     g_quiet = true;
-        else if (!_wcsicmp(a, L"--verbose"))   g_verbose = true;
+        else if (!_wcsicmp(a, L"--probe"))                                      probe = true;
+        else if (!_wcsicmp(a, L"--list-externals"))                             listExt = true;
+        else if (!_wcsicmp(a, L"--json"))                                       g_json = true;
+        else if (!_wcsicmp(a, L"--quiet"))                                      g_quiet = true;
+        else if (!_wcsicmp(a, L"--verbose"))                                    g_verbose = true;
         else if (!_wcsicmp(a, L"--timeout") && i + 1 < argc) timeout = _wtoi(argv[++i]);
         else if (!_wcsicmp(a, L"--help") || !_wcsicmp(a, L"-h") || !_wcsicmp(a, L"/?")) { usage(); return 0; }
         else { fwprintf(stderr, L"unknown option: %s\n\n", a); usage(); return 2; }
@@ -318,11 +600,60 @@ int wmain(int argc, wchar_t** argv)
         return 2;
     }
     if (timeout < 1) timeout = 1;
-    if (!statusOnly && !g_quiet && AttachConsole(ATTACH_PARENT_PROCESS) == FALSE) AllocConsole();
+    if (!statusOnly && !g_quiet && !g_json && AttachConsole(ATTACH_PARENT_PROCESS) == FALSE) AllocConsole();
+
+    /* ---- read-only modes ---- */
+    if (probe) return runProbe();
+
+    if (listExt) {
+        const std::vector<ExtTarget> v = listExternalTargets();
+        if (g_json) {
+            fputs("{\"externals\":[", stdout);
+            for (size_t k = 0; k < v.size(); ++k) {
+                if (k) putchar(',');
+                char nm[512] = {0};
+                WideCharToMultiByte(CP_UTF8, 0, v[k].name, -1, nm, sizeof(nm), NULL, NULL);
+                printf("{\"targetId\":%u,\"available\":%s,\"nameFromEdid\":%s,\"name\":",
+                       (unsigned)v[k].targetId,
+                       v[k].available ? "true" : "false",
+                       v[k].nameFromEdid ? "true" : "false");
+                jsonEscape(nm);
+                putchar('}');
+            }
+            fputs("]}\n", stdout);
+            fflush(stdout);
+        } else {
+            if (v.empty()) { out(L"no external targets found at all."); return 0; }
+            for (const auto& e : v)
+                out(L"  target %-8u  %-16s  %-8s  %s%s",
+                    (unsigned)e.targetId, techLabel(e.tech),
+                    e.available ? L"available" : L"unavailable",
+                    e.name,
+                    e.nameFromEdid ? L"" : L"   (synthesised - no usable EDID)");
+        }
+        return 0;
+    }
 
     if (statusOnly) {
-        reportTopology(L"current topology:");
+        if (g_json) reportTopologyJson();
+        else         reportTopology(L"current topology:");
         return 0;
+    }
+
+    /* Refuse an unsatisfiable name up front rather than after a switch. */
+    if (wantedName && *wantedName) {
+        const std::vector<ExtTarget> v = listExternalTargets();
+        int matches = 0;
+        for (const auto& e : v)
+            if (e.nameFromEdid && wcsstr(e.name, wantedName)) ++matches;
+        if (matches == 0) {
+            wchar_t msg[512];
+            swprintf_s(msg, L"No external display with a usable EDID name matches \"%s\".\n"
+                            L"Run --list-externals to see what is actually present.\n\n"
+                            L"Nothing was changed.", wantedName);
+            fail(msg);
+            return 1;
+        }
     }
 
     const Topology before = queryTopology();
@@ -331,6 +662,7 @@ int wmain(int argc, wchar_t** argv)
                          : resolveToggleTarget(before);
 
     reportTopology(L"before:");
+    if (wantedName && *wantedName) out(L"  requiring the external display to be: %s", wantedName);
 
     if (dryRun) {
         out(L"dry run - nothing was changed.");
@@ -353,7 +685,14 @@ int wmain(int argc, wchar_t** argv)
     }
 
     /* ---- to the external display: this is the one that has to wait ---- */
-    if (isExternalOnly()) { out(L"already showing %s. Nothing to do.", targetName(target)); return 0; }
+    if (isExternalOnly()) {
+        const Topology t = queryTopology();
+        if (nameMatches(t, wantedName)) {
+            out(L"already showing %s. Nothing to do.", targetName(target));
+            return 0;
+        }
+        out(L"an external display is already lit, but not the one you asked for.");
+    }
 
     SetConsoleTitleW(L"ToggleDisplays - waiting for the external display");
 
@@ -367,6 +706,19 @@ int wmain(int argc, wchar_t** argv)
         runDisplaySwitch(L"external");
 
         if (waitFor(isExternalOnly, SETTLE_MS)) {
+            const Topology t = queryTopology();
+            if (!nameMatches(t, wantedName)) {
+                reportTopology(L"after:");
+                wchar_t msg[512];
+                swprintf_s(msg, L"An external display came up, but it is not \"%s\".\n\n"
+                                L"DisplaySwitch.exe cannot be told which external display to\n"
+                                L"prefer - Windows chooses. \"%s\" may be asleep, or on a\n"
+                                L"different connector.\n\n"
+                                L"The internal panel is now off. Run --to-internal to undo.",
+                            wantedName, wantedName);
+                fail(msg);
+                return 1;
+            }
             reportTopology(L"after:");
             out(L"done - showing %s.", targetName(target));
             SetConsoleTitleW(L"ToggleDisplays - done");
